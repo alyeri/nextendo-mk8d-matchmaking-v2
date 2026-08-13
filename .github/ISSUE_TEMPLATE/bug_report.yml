@@ -1,0 +1,48 @@
+name: Bug report
+description: Report a reproducible matchmaking or protocol regression without private data.
+title: "[Bug]: "
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: Do not include tokens, private keys, public IP addresses, saves or copyrighted game files.
+  - type: input
+    id: commit
+    attributes:
+      label: Commit
+      description: Exact commit or server build hash.
+    validations:
+      required: true
+  - type: dropdown
+    id: phase
+    attributes:
+      label: Session phase
+      options:
+        - Authentication
+        - Searching
+        - Joining/forming
+        - Map selection/intermission
+        - Racing
+        - Results
+        - Reconnection
+        - Administration/Redis
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Reproduction
+      description: Sanitized, exact steps and number of clients/networks.
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected and actual behavior
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Sanitized logs
+      render: text

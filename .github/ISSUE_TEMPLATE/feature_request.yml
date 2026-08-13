@@ -1,0 +1,25 @@
+name: Feature request
+description: Propose a compatibility-preserving improvement.
+title: "[Feature]: "
+labels: [enhancement]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: Describe observed behavior or evidence, not only the desired implementation.
+    validations:
+      required: true
+  - type: textarea
+    id: protocol
+    attributes:
+      label: Protocol and compatibility impact
+      description: Identify affected methods, clients and any unknown assumptions.
+    validations:
+      required: true
+  - type: textarea
+    id: verification
+    attributes:
+      label: Test and rollback plan
+    validations:
+      required: true

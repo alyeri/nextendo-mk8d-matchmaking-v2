@@ -1,0 +1,33 @@
+# Build outputs
+*.exe
+*.linux
+*.out
+*.so
+*.dll
+*.dylib
+/bin/
+/dist/
+/.cache/
+
+# Local configuration and secrets
+.env
+*.pem
+*.key
+*.pfx
+*.crt
+!deploy/tls/.gitkeep
+
+# Runtime state
+/data/
+/deploy/data/
+*.jsonl
+nncs-nat-observations.txt
+
+# Captures, logs, editor and OS metadata
+*.bin
+*.log
+captured/
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
