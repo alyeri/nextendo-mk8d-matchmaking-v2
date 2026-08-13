@@ -19,8 +19,8 @@ jobs:
       run:
         working-directory: ${{ matrix.module }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
         with:
           go-version: "1.23.x"
           cache-dependency-path: |
@@ -44,18 +44,19 @@ jobs:
       run:
         working-directory: ${{ matrix.module }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
         with:
           go-version: "1.23.x"
+          cache-dependency-path: ${{ matrix.module }}/go.sum
       - run: go test -race -count=1 ./...
 
   build:
     name: Reproducible Linux build
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
         with:
           go-version: "1.23.x"
           cache-dependency-path: |
@@ -64,7 +65,7 @@ jobs:
       - name: Build static server
         working-directory: server
         run: CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -ldflags="-s -w" -o ../dist/mk8d-server .
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: mk8d-server-linux-amd64
           path: dist/mk8d-server
@@ -74,7 +75,7 @@ jobs:
     name: Compose validation and container build
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Validate Compose configuration
         run: |
           cp .env.example .env
