@@ -80,10 +80,14 @@ func main() {
 	secureEndpoint.SetSecureAccount(securePassword, securePID)
 
 	mm := nex.NewMatchmaking()
+	rmcDedup := newRMCDeduplicator(
+		time.Duration(envOrInt("MATCHMAKING_DEDUP_SECONDS", 20))*time.Second,
+		envOrInt("MATCHMAKING_DEDUP_MAX_ENTRIES", defaultRMCDedupEntries),
+	)
 	secureEndpoint.Register(nex.ProtocolSecureConnection, nex.SecureConnectionHandler())
-	secureEndpoint.Register(nex.ProtocolMatchmakeExtension, mm.ExtensionHandler())
-	secureEndpoint.Register(nex.ProtocolMatchMaking, mm.MatchMakingHandler())
-	secureEndpoint.Register(nex.ProtocolMatchMakingExt, mm.MatchMakingExtHandler())
+	secureEndpoint.Register(nex.ProtocolMatchmakeExtension, rmcDedup.wrap(mm.ExtensionHandler()))
+	secureEndpoint.Register(nex.ProtocolMatchMaking, rmcDedup.wrap(mm.MatchMakingHandler()))
+	secureEndpoint.Register(nex.ProtocolMatchMakingExt, rmcDedup.wrap(mm.MatchMakingExtHandler()))
 	secureEndpoint.Register(nex.ProtocolNATTraversal, nex.NATTraversalHandler())
 	secureEndpoint.Register(nex.ProtocolRanking, nex.RankingHandler())
 	secureEndpoint.Register(nex.ProtocolUtility, nex.UtilityHandler())
@@ -237,6 +241,7 @@ func resolveUser(username string, extraData []byte) (uint64, []byte, bool) {
 var revokedNexPayloads = map[string]bool{
 	"1800000006.Kazuu.1787343209": true, // fuite release 1.6.5-win (Kazuu / PID 1800000006)
 }
+
 // nextendoPIDFromToken validates a "nx2.<b64(pid.username.expiry)>.<b64(hmac)>"
 // token signed by the account service (HMAC-SHA256, "nex:" prefix).
 func nextendoPIDFromToken(s string) (uint64, bool) {
