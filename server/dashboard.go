@@ -12,10 +12,9 @@ import (
 	"crypto/subtle"
 	"encoding/json"
 	"fmt"
-	"io"
-	"net"
 	"net/http"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -47,6 +46,9 @@ type playerInfo struct {
 	Calls      int64
 	LastProto  uint16
 	LastMethod uint32
+	NATMap     uint32 // NAT mapping behaviour (from NATTraversal ReportNATProperties)
+	NATFilter  uint32 // NAT filtering behaviour
+	Ping       uint32 // RTT in ms the client reported (0 = unknown)
 }
 
 type rmcEvent struct {
@@ -54,6 +56,18 @@ type rmcEvent struct {
 	PID    uint64
 	Proto  uint16
 	Method uint32
+}
+
+// ghostIdle : au-delà de cette inactivité RMC, une connexion PRUDP encore ouverte (le client
+// continue d'envoyer des PING) est considérée FANTÔME et n'est plus comptée « en ligne » par
+// le monitoring. Sans ce seuil, un émulateur/une console laissé ouvert pingue pendant des
+// jours et s'affichait « en ligne depuis 100 h ». Même notion de fantôme que la garde « un
+// seul endroit » côté compte (env NEXTENDO_GHOST_IDLE_SECONDS, défaut 15 min).
+func ghostIdle() time.Duration {
+	if n, err := strconv.Atoi(envOr("NEXTENDO_GHOST_IDLE_SECONDS", "")); err == nil && n > 0 {
+		return time.Duration(n) * time.Second
+	}
+	return 15 * time.Minute
 }
 
 // noteRMC records an RMC call (fed from endpoint.OnRMC): updates the player, the
@@ -66,13 +80,19 @@ func noteRMC(c *nex.Connection, req *nex.RMCMessage) {
 	atomic.AddInt64(&rmcTotal, 1)
 
 	metaMu.Lock()
+	now := time.Now()
 	pi := playerMeta[pid]
 	if pi == nil {
-		pi = &playerInfo{PID: pid, FirstSeen: time.Now()}
+		pi = &playerInfo{PID: pid, FirstSeen: now}
 		playerMeta[pid] = pi
 		sessionsSeen++
+	} else if !pi.LastSeen.IsZero() && now.Sub(pi.LastSeen) > ghostIdle() {
+		// Le joueur était dormant (aucune action RMC depuis > seuil fantôme) : on repart sur
+		// une NOUVELLE session en ligne. Sans ça, « en ligne depuis » comptait depuis le tout
+		// premier paquet du process (des jours) — d'où des « en ligne depuis 100 h » aberrants.
+		pi.FirstSeen = now
 	}
-	pi.LastSeen = time.Now()
+	pi.LastSeen = now
 	pi.Calls++
 	pi.LastProto = req.Protocol
 	pi.LastMethod = req.Method
@@ -88,6 +108,89 @@ func noteRMC(c *nex.Connection, req *nex.RMCMessage) {
 	}
 	methodCount[rmcName(req.Protocol, req.Method)]++
 	eventsMu.Unlock()
+}
+
+// natTypeLabel turns the NAT mapping+filtering behaviours (ReportNATProperties) into a
+// player-facing type for the dashboard.
+func natTypeLabel(m, f uint32) string {
+	if m == 0 && f == 0 {
+		return ""
+	}
+	if m <= 1 && f <= 1 {
+		return "Ouvert"
+	}
+	if m <= 1 {
+		return "Modéré"
+	}
+	return "Strict"
+}
+
+// noteNAT records a player's NAT behaviour + ping. Wired to endpoint.OnNATProperties so the
+// monitoring site shows NAT type and latency again (lost when the game moved off the previous stack).
+func noteNAT(pid uint64, natMap, natFilter, rtt uint32) {
+	if pid == 0 {
+		return
+	}
+	metaMu.Lock()
+	defer metaMu.Unlock()
+	pi := playerMeta[pid]
+	if pi == nil {
+		pi = &playerInfo{PID: pid, FirstSeen: time.Now()}
+		playerMeta[pid] = pi
+	}
+	pi.NATMap = natMap
+	pi.NATFilter = natFilter
+	if rtt > 0 {
+		pi.Ping = rtt
+	}
+}
+
+// ----- GeoIP (best-effort, cached) ------------------------------------------
+
+var (
+	geoMu     sync.Mutex
+	geoCache  = map[string]geoInfo{}
+	geoClient = &http.Client{Timeout: 4 * time.Second}
+)
+
+type geoInfo struct {
+	Country string `json:"country"`
+	CC      string `json:"countryCode"`
+	City    string `json:"city"`
+	ISP     string `json:"isp"`
+}
+
+func ipOnly(addr string) string {
+	if i := strings.LastIndex(addr, ":"); i > 0 {
+		return addr[:i]
+	}
+	return addr
+}
+
+// geoLookup returns a cached IP geolocation, fetching it once asynchronously (ip-api.com):
+// the first call for an IP returns empty and kicks off the fetch, later calls get the result.
+func geoLookup(addr string) geoInfo {
+	ip := ipOnly(addr)
+	geoMu.Lock()
+	g, ok := geoCache[ip]
+	if !ok {
+		geoCache[ip] = geoInfo{} // placeholder so we only fetch once
+		geoMu.Unlock()
+		go func() {
+			var gi geoInfo
+			resp, err := geoClient.Get("http://ip-api.com/json/" + ip + "?fields=country,countryCode,city,isp")
+			if err == nil {
+				defer resp.Body.Close()
+				_ = json.NewDecoder(resp.Body).Decode(&gi)
+			}
+			geoMu.Lock()
+			geoCache[ip] = gi
+			geoMu.Unlock()
+		}()
+		return geoInfo{}
+	}
+	geoMu.Unlock()
+	return g
 }
 
 // gameModeName maps MK8 online MatchmakeSession game_mode -> a human label.
@@ -157,6 +260,12 @@ type apiPlayer struct {
 	Calls      int64  `json:"calls"`
 	LastAction string `json:"lastAction"`
 	IdleSecs   int    `json:"idleSeconds"`
+	Country    string `json:"country"`
+	CC         string `json:"cc"`
+	City       string `json:"city"`
+	ISP        string `json:"isp"`
+	NatType    string `json:"natType"`
+	Ping       int    `json:"ping"`
 	VR         uint32 `json:"vr"`
 	Mode       string `json:"mode"`
 	IsHost     bool   `json:"isHost"`
@@ -181,6 +290,7 @@ type apiGathering struct {
 	Max      uint16      `json:"max"`
 	State    string      `json:"state"`
 	Code     string      `json:"code,omitempty"`
+	Attribs  []uint32    `json:"attribs,omitempty"`
 }
 
 type apiEvent struct {
@@ -229,16 +339,19 @@ func buildStats(endpoint *nex.Endpoint, mm *nex.Matchmaking) apiStats {
 
 	// Snapshot per-player metadata under the lock.
 	type metaSnap struct {
-		calls       int64
-		first, last time.Time
-		proto       uint16
-		meth        uint32
-		ip          string
+		calls              int64
+		first, last        time.Time
+		proto              uint16
+		meth               uint32
+		ip                 string
+		natMap, natFilter  uint32
+		ping               uint32
 	}
 	metaMu.Lock()
 	snap := make(map[uint64]metaSnap, len(playerMeta))
 	for pid, pi := range playerMeta {
-		snap[pid] = metaSnap{calls: pi.Calls, first: pi.FirstSeen, last: pi.LastSeen, proto: pi.LastProto, meth: pi.LastMethod, ip: pi.IP}
+		snap[pid] = metaSnap{calls: pi.Calls, first: pi.FirstSeen, last: pi.LastSeen, proto: pi.LastProto, meth: pi.LastMethod, ip: pi.IP,
+			natMap: pi.NATMap, natFilter: pi.NATFilter, ping: pi.Ping}
 	}
 	metaMu.Unlock()
 
@@ -275,6 +388,7 @@ func buildStats(endpoint *nex.Endpoint, mm *nex.Matchmaking) apiStats {
 			ID: g.ID, HostPID: g.HostPID, HostName: dispName(g.HostPID),
 			Type: gameModeName(g.GameMode), Mode: g.GameMode, VR: g.VR,
 			Players: lps, Count: len(g.Participants), Max: max, State: state, Code: g.Code,
+			Attribs: g.Attribs,
 		})
 	}
 	sort.Slice(gs, func(i, j int) bool { return gs[i].ID < gs[j].ID })
@@ -288,14 +402,19 @@ func buildStats(endpoint *nex.Endpoint, mm *nex.Matchmaking) apiStats {
 		if pid == 0 || seen[pid] {
 			continue
 		}
-		seen[pid] = true
 		s := snap[pid]
-		online, idle, last := 0, 0, ""
-		if !s.first.IsZero() {
-			online = int(time.Since(s.first).Seconds())
-			idle = int(time.Since(s.last).Seconds())
-			last = rmcName(s.proto, s.meth)
+		// Fantôme : la connexion PRUDP est encore ouverte (le client envoie des PING) mais le
+		// joueur n'a fait AUCUNE action RMC depuis > seuil. Ce sont des émulateurs/consoles
+		// laissés ouverts qui pinguent pendant des jours ; les compter « en ligne » affichait
+		// des « en ligne depuis 100 h » et gonflait le compteur. On les exclut du monitoring
+		// (même notion de fantôme que la garde « un seul endroit », cf online_presence.go).
+		if s.last.IsZero() || time.Since(s.last) > ghostIdle() {
+			continue
 		}
+		seen[pid] = true
+		online := int(time.Since(s.first).Seconds())
+		idle := int(time.Since(s.last).Seconds())
+		last := rmcName(s.proto, s.meth)
 		ip := c.Addr
 		if ip == "" {
 			ip = s.ip
@@ -310,9 +429,12 @@ func buildStats(endpoint *nex.Endpoint, mm *nex.Matchmaking) apiStats {
 		if m := pidMode[pid]; m != 0 {
 			modeLabel = gameModeName(m)
 		}
+		geo := geoLookup(ip)
 		players = append(players, apiPlayer{
 			PID: pid, Name: dispName(pid), IP: ip, State: state, Gathering: gid,
 			OnlineSecs: online, Calls: s.calls, LastAction: last, IdleSecs: idle,
+			Country: geo.Country, CC: geo.CC, City: geo.City, ISP: geo.ISP,
+			NatType: natTypeLabel(s.natMap, s.natFilter), Ping: int(s.ping),
 			VR: pidVR[pid], Mode: modeLabel, IsHost: pidIsHost[pid],
 		})
 	}
@@ -348,8 +470,8 @@ func buildStats(endpoint *nex.Endpoint, mm *nex.Matchmaking) apiStats {
 		PeakConnected:  peakConnected,
 		Server: apiServer{
 			AccessKey: accessKey, NexVersion: "4.0.0", AuthPort: fmt.Sprintf("%d", authPort),
-			SecurePort: securePort, SNIHost: envOr("NEXTENDO_SNI_HOST", ""), SessionKey: sessionKeyLen,
-			Stack: "nextendo-nex",
+			SecurePort: securePort, SNIHost: "g2b309e01-lp1.s.n.srv.nintendo.net", SessionKey: sessionKeyLen,
+			Stack: "closed-source (no AGPL)",
 		},
 		Players:    players,
 		Gatherings: gs,
@@ -358,116 +480,19 @@ func buildStats(endpoint *nex.Endpoint, mm *nex.Matchmaking) apiStats {
 	}
 }
 
-func writePrometheusMetrics(w http.ResponseWriter, endpoint *nex.Endpoint, mm *nex.Matchmaking) {
-	w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
-	w.Header().Set("Cache-Control", "no-store")
+// startDashboard serves the per-game /api/stats JSON, gated by DASH_TOKEN (?key=).
+func startDashboard(endpoint *nex.Endpoint, mm *nex.Matchmaking) {
+	port := envOr("DASH_PORT", "8082")
+	token := envOr("DASH_TOKEN", "")
 
-	stats := buildStats(endpoint, mm)
-	matchmaking := mm.Metrics()
-	nncs := snapshotNNCSMetrics()
-
-	fmt.Fprintln(w, "# HELP nextendo_mk8d_uptime_seconds Process uptime in seconds.")
-	fmt.Fprintln(w, "# TYPE nextendo_mk8d_uptime_seconds gauge")
-	fmt.Fprintf(w, "nextendo_mk8d_uptime_seconds %d\n", stats.UptimeSeconds)
-	fmt.Fprintln(w, "# TYPE nextendo_mk8d_connected_players gauge")
-	fmt.Fprintf(w, "nextendo_mk8d_connected_players %d\n", stats.Connected)
-	fmt.Fprintln(w, "# TYPE nextendo_mk8d_active_lobbies gauge")
-	fmt.Fprintf(w, "nextendo_mk8d_active_lobbies %d\n", stats.ActiveLobbies)
-	fmt.Fprintln(w, "# TYPE nextendo_mk8d_players_in_lobbies gauge")
-	fmt.Fprintf(w, "nextendo_mk8d_players_in_lobbies %d\n", stats.InLobby)
-	fmt.Fprintln(w, "# TYPE nextendo_mk8d_rmc_total counter")
-	fmt.Fprintf(w, "nextendo_mk8d_rmc_total %d\n", stats.TotalRMC)
-	fmt.Fprintln(w, "# TYPE nextendo_mk8d_sessions_seen_total counter")
-	fmt.Fprintf(w, "nextendo_mk8d_sessions_seen_total %d\n", stats.TotalSessions)
-
-	fmt.Fprintln(w, "# TYPE nextendo_mk8d_matchmaking_gatherings_created_total counter")
-	fmt.Fprintf(w, "nextendo_mk8d_matchmaking_gatherings_created_total %d\n", matchmaking.GatheringsCreated)
-	fmt.Fprintln(w, "# TYPE nextendo_mk8d_matchmaking_joins_committed_total counter")
-	fmt.Fprintf(w, "nextendo_mk8d_matchmaking_joins_committed_total %d\n", matchmaking.JoinsCommitted)
-	fmt.Fprintln(w, "# TYPE nextendo_mk8d_matchmaking_reservations_rejected_total counter")
-	fmt.Fprintf(w, "nextendo_mk8d_matchmaking_reservations_rejected_total %d\n", matchmaking.ReservationsRejected)
-	fmt.Fprintln(w, "# TYPE nextendo_mk8d_matchmaking_candidates_selected_total counter")
-	fmt.Fprintf(w, "nextendo_mk8d_matchmaking_candidates_selected_total %d\n", matchmaking.CandidatesSelected)
-	fmt.Fprintln(w, "# TYPE nextendo_mk8d_reconnect_leases_total counter")
-	fmt.Fprintf(w, "nextendo_mk8d_reconnect_leases_total %d\n", matchmaking.ReconnectLeases)
-	fmt.Fprintln(w, "# TYPE nextendo_mk8d_reconnect_recovered_total counter")
-	fmt.Fprintf(w, "nextendo_mk8d_reconnect_recovered_total %d\n", matchmaking.ReconnectRecovered)
-	fmt.Fprintln(w, "# TYPE nextendo_mk8d_disconnect_evictions_total counter")
-	fmt.Fprintf(w, "nextendo_mk8d_disconnect_evictions_total %d\n", matchmaking.DisconnectEvictions)
-
-	phaseCounts := map[nex.SessionPhase]int{}
-	for _, session := range mm.SessionInfos() {
-		phaseCounts[session.Phase]++
-	}
-	fmt.Fprintln(w, "# TYPE nextendo_mk8d_lobbies_by_phase gauge")
-	for phase := nex.SessionSearching; phase <= nex.SessionClosing; phase++ {
-		fmt.Fprintf(w, "nextendo_mk8d_lobbies_by_phase{phase=%q} %d\n", phase.String(), phaseCounts[phase])
-	}
-
-	fmt.Fprintln(w, "# TYPE nextendo_mk8d_nncs_valid_requests_total counter")
-	fmt.Fprintf(w, "nextendo_mk8d_nncs_valid_requests_total %d\n", nncs.ValidRequests)
-	fmt.Fprintln(w, "# TYPE nextendo_mk8d_nncs_invalid_requests_total counter")
-	fmt.Fprintf(w, "nextendo_mk8d_nncs_invalid_requests_total %d\n", nncs.InvalidRequests)
-	fmt.Fprintln(w, "# TYPE nextendo_mk8d_nncs_replies_total counter")
-	fmt.Fprintf(w, "nextendo_mk8d_nncs_replies_total %d\n", nncs.RepliesSent)
-	fmt.Fprintln(w, "# TYPE nextendo_mk8d_nncs_reply_errors_total counter")
-	fmt.Fprintf(w, "nextendo_mk8d_nncs_reply_errors_total %d\n", nncs.ReplyErrors)
-	fmt.Fprintln(w, "# TYPE nextendo_mk8d_nncs_filter_probes_total counter")
-	fmt.Fprintf(w, "nextendo_mk8d_nncs_filter_probes_total %d\n", nncs.FilterProbesSent)
-	fmt.Fprintln(w, "# TYPE nextendo_mk8d_nncs_observations_total counter")
-	fmt.Fprintf(w, "nextendo_mk8d_nncs_observations_total %d\n", nncs.ObservationsSaved)
-	fmt.Fprintln(w, "# TYPE nextendo_mk8d_nncs_observation_errors_total counter")
-	fmt.Fprintf(w, "nextendo_mk8d_nncs_observation_errors_total %d\n", nncs.ObservationErrors)
-	fmt.Fprintln(w, "# TYPE nextendo_mk8d_nncs_silent_packets_total counter")
-	fmt.Fprintf(w, "nextendo_mk8d_nncs_silent_packets_total %d\n", nncs.SilentPackets)
-
-	eventsMu.Lock()
-	methods := make(map[string]int64, len(methodCount))
-	for name, count := range methodCount {
-		methods[name] = count
-	}
-	eventsMu.Unlock()
-	fmt.Fprintln(w, "# TYPE nextendo_mk8d_rmc_method_total counter")
-	for name, count := range methods {
-		fmt.Fprintf(w, "nextendo_mk8d_rmc_method_total{method=%q} %d\n", name, count)
-	}
-}
-
-type apiRoomsResponse struct {
-	SchemaVersion int               `json:"schemaVersion"`
-	UpdatedAt     string            `json:"updatedAt"`
-	Redis         map[string]any    `json:"redis"`
-	Rooms         []redisRoomRecord `json:"rooms"`
-}
-
-func buildRoomsResponse(mm *nex.Matchmaking, redisState *redisStatePublisher) apiRoomsResponse {
-	now := time.Now().UTC()
-	enabled, healthy, instance := redisState.status()
-	snapshot, _ := buildRedisRoomSnapshot(instance, now, mm.SessionInfos())
-	return apiRoomsResponse{
-		SchemaVersion: 1,
-		UpdatedAt:     now.Format(time.RFC3339Nano),
-		Redis:         map[string]any{"enabled": enabled, "healthy": healthy, "instance": instance},
-		Rooms:         snapshot.Rooms,
-	}
-}
-
-func dashboardMux(endpoint *nex.Endpoint, mm *nex.Matchmaking, redisState *redisStatePublisher, token string) *http.ServeMux {
 	// SÉCURITÉ : sans jeton configuré on REFUSE, au lieu d'ouvrir l'API à tout le monde.
 	// L'ancienne condition (token == "") laissait la liste des joueurs — pseudos, PID et
 	// adresses IP — lisible sans authentification dès que la variable manquait.
 	// Comparaison à temps constant : un test == fuit la longueur du préfixe correct.
 	authed := func(w http.ResponseWriter, r *http.Request) bool {
-		const prefix = "Bearer "
-		header := strings.TrimSpace(r.Header.Get("Authorization"))
-		provided := ""
-		if strings.HasPrefix(header, prefix) {
-			provided = strings.TrimSpace(strings.TrimPrefix(header, prefix))
-		}
-		if token != "" && subtle.ConstantTimeCompare([]byte(provided), []byte(token)) == 1 {
+		if token != "" && subtle.ConstantTimeCompare([]byte(r.URL.Query().Get("key")), []byte(token)) == 1 {
 			return true
 		}
-		w.Header().Set("WWW-Authenticate", `Bearer realm="nextendo-admin"`)
 		http.Error(w, "forbidden", http.StatusForbidden)
 		return false
 	}
@@ -481,20 +506,6 @@ func dashboardMux(endpoint *nex.Endpoint, mm *nex.Matchmaking, redisState *redis
 		w.Header().Set("Cache-Control", "no-store")
 		_ = json.NewEncoder(w).Encode(buildStats(endpoint, mm))
 	})
-	mux.HandleFunc("/api/rooms", func(w http.ResponseWriter, r *http.Request) {
-		if !authed(w, r) {
-			return
-		}
-		w.Header().Set("Content-Type", "application/json")
-		w.Header().Set("Cache-Control", "no-store")
-		_ = json.NewEncoder(w).Encode(buildRoomsResponse(mm, redisState))
-	})
-	mux.HandleFunc("/metrics", func(w http.ResponseWriter, r *http.Request) {
-		if !authed(w, r) {
-			return
-		}
-		writePrometheusMetrics(w, endpoint, mm)
-	})
 	// /api/kick — libère un compte resté coincé derrière une connexion morte, sans
 	// redémarrer le serveur (ce qui déconnecterait tous les joueurs en partie).
 	//   ?pid=<PID>     déconnecte toutes les connexions de ce compte
@@ -504,53 +515,22 @@ func dashboardMux(endpoint *nex.Endpoint, mm *nex.Matchmaking, redisState *redis
 		if !authed(w, r) {
 			return
 		}
-		if r.Method != http.MethodPost {
-			w.Header().Set("Allow", http.MethodPost)
-			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-			return
-		}
 		w.Header().Set("Content-Type", "application/json")
 		w.Header().Set("Cache-Control", "no-store")
-		var body struct {
-			PID   uint64 `json:"pid"`
-			RVCID uint32 `json:"rvcid"`
-		}
-		decoder := json.NewDecoder(http.MaxBytesReader(w, r.Body, 4096))
-		decoder.DisallowUnknownFields()
-		if err := decoder.Decode(&body); err != nil && err != io.EOF {
-			http.Error(w, "invalid JSON body", http.StatusBadRequest)
+		if pid, err := strconv.ParseUint(r.URL.Query().Get("pid"), 10, 64); err == nil && pid != 0 {
+			_ = json.NewEncoder(w).Encode(map[string]any{"pid": pid, "kicked": endpoint.KickPID(pid)})
 			return
 		}
-		if body.PID != 0 && body.RVCID != 0 {
-			http.Error(w, "provide either pid or rvcid", http.StatusBadRequest)
-			return
-		}
-		if body.PID != 0 {
-			_ = json.NewEncoder(w).Encode(map[string]any{"pid": body.PID, "kicked": endpoint.KickPID(body.PID)})
-			return
-		}
-		if body.RVCID != 0 {
-			_ = json.NewEncoder(w).Encode(map[string]any{"rvcid": body.RVCID, "kicked": endpoint.KickConnection(body.RVCID)})
+		if rv, err := strconv.ParseUint(r.URL.Query().Get("rvcid"), 10, 32); err == nil && rv != 0 {
+			_ = json.NewEncoder(w).Encode(map[string]any{"rvcid": rv, "kicked": endpoint.KickConnection(uint32(rv))})
 			return
 		}
 		_ = json.NewEncoder(w).Encode(map[string]any{"reaped": endpoint.ReapIdle(nex.ReapIdleTimeout())})
 	})
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) { fmt.Fprintln(w, "ok") })
-	return mux
-}
 
-// startDashboard binds to loopback by default. Public access should go through
-// an explicitly authenticated reverse proxy or an SSH tunnel, never a cloud
-// firewall rule exposing the administrative port directly.
-func startDashboard(endpoint *nex.Endpoint, mm *nex.Matchmaking, redisState *redisStatePublisher) {
-	port := envOr("DASH_PORT", "8082")
-	bind := envOr("DASH_BIND", "127.0.0.1")
-	token := envOr("DASH_TOKEN", "")
-	mux := dashboardMux(endpoint, mm, redisState, token)
-	address := net.JoinHostPort(bind, port)
-
-	fmt.Printf("[MK8 Dashboard] stats API on %s (bearer=%v)\n", address, token != "")
-	if err := http.ListenAndServe(address, mux); err != nil {
+	fmt.Printf("[MK8 Dashboard] stats API on :%s (token=%v)\n", port, token != "")
+	if err := http.ListenAndServe(":"+port, mux); err != nil {
 		fmt.Printf("[MK8 Dashboard] HTTP error: %v\n", err)
 	}
 }

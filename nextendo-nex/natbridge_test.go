@@ -3,9 +3,7 @@ package nex
 import (
 	"os"
 	"path/filepath"
-	"strconv"
 	"testing"
-	"time"
 )
 
 // writeNatFile lays down an nncs-style observation file and points the bridge at it.
@@ -20,7 +18,6 @@ func writeNatFile(t *testing.T, body string) {
 	// The reader caches for 2s; drop it so each test sees its own file.
 	natCacheMu.Lock()
 	natCache = nil
-	natBindings = nil
 	natCacheMu.Unlock()
 }
 
@@ -43,7 +40,7 @@ func hostStations() []*StationURL {
 func TestNatBridgeSubstitutesObservedUdpPort(t *testing.T) {
 	writeNatFile(t, "203.0.113.9 40822\n198.51.100.1 1234\n")
 
-	out, status := natBridgeStations(hostStations())
+	out, status := natBridgeStations(hostStations(), false)
 	if status != bridgeOK {
 		t.Fatalf("bridge should have substituted, status=%v", status)
 	}
@@ -83,74 +80,12 @@ func TestNatBridgeSubstitutesObservedUdpPort(t *testing.T) {
 	}
 }
 
-func TestNatBridgeUsesFreshTimestampedObservation(t *testing.T) {
-	now := time.Now().Unix()
-	writeNatFile(t, "203.0.113.9 40000 "+itoa64(now-600)+"\n203.0.113.9 40822 "+itoa64(now)+"\n")
-
-	if port, ok := natPortForIP("203.0.113.9"); !ok || port != 40822 {
-		t.Fatalf("fresh observed port = %d, ok=%v; want 40822", port, ok)
-	}
-}
-
-func TestNatBridgeSeparatesTwoConsolesBehindSamePublicIP(t *testing.T) {
-	now := time.Now().Unix()
-	writeNatFile(t, "203.0.113.9 40822 "+itoa64(now-1)+"\n203.0.113.9 41933 "+itoa64(now)+"\n")
-
-	hostOne := hostStations()
-	hostOne[0].SetInt("port", 40822)
-	hostOne[0].SetInt("RVCID", 777)
-	hostTwo := hostStations()
-	hostTwo[0].SetInt("port", 41933)
-	hostTwo[0].SetInt("RVCID", 778)
-
-	one, statusOne := natBridgeStations(hostOne)
-	two, statusTwo := natBridgeStations(hostTwo)
-	if statusOne != bridgeOK || statusTwo != bridgeOK {
-		t.Fatalf("shared-NAT bridge status = (%v, %v), want both bridgeOK", statusOne, statusTwo)
-	}
-	if got := one[1].GetInt("port"); got != 40822 {
-		t.Errorf("first RVCID received port %d, want its own 40822", got)
-	}
-	if got := two[1].GetInt("port"); got != 41933 {
-		t.Errorf("second RVCID received port %d, want its own 41933", got)
-	}
-
-	oneAgain, status := natBridgeStations(hostOne)
-	if status != bridgeOK || oneAgain[1].GetInt("port") != 40822 {
-		t.Fatalf("first RVCID was overwritten: status=%v port=%d", status, oneAgain[1].GetInt("port"))
-	}
-}
-
-func TestNatBridgeDoesNotGuessAmongSharedIPObservations(t *testing.T) {
-	now := time.Now().Unix()
-	writeNatFile(t, "203.0.113.9 40822 "+itoa64(now-1)+"\n203.0.113.9 41933 "+itoa64(now)+"\n")
-
-	unknown := hostStations()
-	unknown[0].SetInt("port", 49999)
-	unknown[0].SetInt("RVCID", 779)
-	out, status := natBridgeStations(unknown)
-	if status != bridgeNoObservation {
-		t.Fatalf("ambiguous shared-NAT station status=%v, want bridgeNoObservation", status)
-	}
-	if got := out[1].GetInt("port"); got != 54321 {
-		t.Fatalf("ambiguous station was pointed at another console: port=%d", got)
-	}
-}
-
-func TestNatBridgeRejectsOnlyStaleTimestampedObservation(t *testing.T) {
-	writeNatFile(t, "203.0.113.9 40000 "+itoa64(time.Now().Add(-10*time.Minute).Unix())+"\n")
-
-	if port, ok := natPortForIP("203.0.113.9"); ok {
-		t.Fatalf("stale observed port = %d was accepted", port)
-	}
-}
-
 // A "type=" left in the key order serialises differently from an absent key. Removing a
 // param must drop it from the wire form too, or the LAN candidate still reads as public.
 func TestRemovedParamsAreAbsentFromTheWireForm(t *testing.T) {
 	writeNatFile(t, "203.0.113.9 40822\n")
 
-	bridged, _ := natBridgeStations(hostStations())
+	bridged, _ := natBridgeStations(hostStations(), false)
 	lan := bridged[0].String()
 
 	for _, bad := range []string{"type=", "Pa="} {
@@ -166,7 +101,7 @@ func TestNatBridgeFallsBackToRawUrls(t *testing.T) {
 	t.Run("no observation for this ip", func(t *testing.T) {
 		writeNatFile(t, "198.51.100.1 1234\n")
 		in := hostStations()
-		if out, _ := natBridgeStations(in); out[1].GetInt("port") != 54321 {
+		if out, _ := natBridgeStations(in, false); out[1].GetInt("port") != 54321 {
 			t.Errorf("unobserved host must keep its registered urls")
 		}
 	})
@@ -177,7 +112,7 @@ func TestNatBridgeFallsBackToRawUrls(t *testing.T) {
 		natCache = nil
 		natCacheMu.Unlock()
 
-		if out, _ := natBridgeStations(hostStations()); out[1].GetInt("port") != 54321 {
+		if out, _ := natBridgeStations(hostStations(), false); out[1].GetInt("port") != 54321 {
 			t.Errorf("a missing nat file must not change the urls")
 		}
 	})
@@ -186,7 +121,7 @@ func TestNatBridgeFallsBackToRawUrls(t *testing.T) {
 		writeNatFile(t, "203.0.113.9 40822\n")
 		in := hostStations()
 		in[0].Set("RVCID", "0") // ReplaceURL not received yet
-		if out, _ := natBridgeStations(in); out[1].GetInt("port") != 54321 {
+		if out, _ := natBridgeStations(in, false); out[1].GetInt("port") != 54321 {
 			t.Errorf("without an RVCID the joiner cannot probe; urls must be left alone")
 		}
 	})
@@ -196,7 +131,7 @@ func TestNatBridgeFallsBackToRawUrls(t *testing.T) {
 		lan := NewStationURL("prudp")
 		lan.Set("address", "192.168.1.42")
 		in := []*StationURL{lan}
-		if out, _ := natBridgeStations(in); len(out) != 1 {
+		if out, _ := natBridgeStations(in, false); len(out) != 1 {
 			t.Errorf("a host with no public url must be left alone")
 		}
 	})
@@ -210,8 +145,4 @@ func contains(s, sub string) bool {
 	}
 
 	return false
-}
-
-func itoa64(value int64) string {
-	return strconv.FormatInt(value, 10)
 }

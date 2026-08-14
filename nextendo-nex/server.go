@@ -17,6 +17,11 @@ import (
 type Server struct {
 	Endpoint *Endpoint
 	conns    sync.Map // *gws.Conn -> *Connection
+
+	// CustomHTTPHandler, when set, answers plain HTTP requests on a path other
+	// than "/" instead of attempting a WebSocket upgrade. nil by default, so the
+	// transport behaves exactly as before for every existing title.
+	CustomHTTPHandler func(w http.ResponseWriter, r *http.Request)
 }
 
 // NewServer wraps an endpoint in a WebSocket transport.
@@ -67,6 +72,10 @@ func (s *Server) mux() *http.ServeMux {
 	})
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/" && s.CustomHTTPHandler != nil {
+			s.CustomHTTPHandler(w, r)
+			return
+		}
 		socket, err := upgrader.Upgrade(w, r)
 		if err != nil {
 			fmt.Printf("[WS] upgrade failed from %s path=%q proto=%q: %v\n",

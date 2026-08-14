@@ -19,7 +19,7 @@ import (
 // placeholder PID (the console's own hosted session is then owned by a phantom PID →
 // crash). Enabling PROXY protocol on the Traefik service makes it prepend the real
 // client address, which we parse here so the auth sees the same IP as the secure
-// connection. MK8 (direct :443 on a direct host, no proxy) doesn't need this.
+// connection. MK8 (direct :443 on OVH, no proxy) doesn't need this.
 
 // proxyConn overrides RemoteAddr with the real client address from the PROXY header.
 type proxyConn struct {

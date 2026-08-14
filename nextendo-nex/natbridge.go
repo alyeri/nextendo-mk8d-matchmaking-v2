@@ -21,8 +21,8 @@ import (
 // Without it the joiner gets the TCP port, the probe never lands, and the console gives
 // up: it stops after MatchMakingExt m=1 and re-registers in a loop until the game shows a
 // connection error. That is the exact shape of the MK8 worldwide failure, and it is why
-// worldwide broke when MK8 moved to this core — the previous stack had this bridge
-// (the reference implementation had it), and it was not ported.
+// worldwide broke when MK8 moved to this core — the nex-go stack had this bridge
+// (nex-protocols-common-go/match-making/get_session_urls.go), and it was not ported.
 //
 // The file is written by the nncs responder co-located with the game server
 // (NNCS_NAT_FILE). It MUST be local: a responder on another host cannot share it.
@@ -45,8 +45,7 @@ const (
 	bridgeNoRVCID
 )
 
-// natFilePath is where the co-located nncs responder writes
-// "<public ip> <udp port> [unix timestamp]" lines.
+// natFilePath is where the co-located nncs responder writes "<public ip> <udp port>" lines.
 func natFilePath() string {
 	if p := os.Getenv("NNCS_NAT_FILE"); p != "" {
 		return p
@@ -54,33 +53,52 @@ func natFilePath() string {
 	return "/data/nat_endpoints.txt"
 }
 
-// GetSessionURLs is on the hot path of every join. Cache the append-only observation file
-// briefly rather than re-reading per call; 2s is far below how long an endpoint stays valid
-// and still picks up a fresh probe within one matchmaking round.
+// The file is rewritten whole on every probe, and GetSessionURLs is on the hot path of
+// every join. Cache it briefly rather than re-reading per call; 2s is far below how long
+// an endpoint stays valid and still picks up a fresh probe within one matchmaking round.
 var (
 	natCacheMu   sync.Mutex
-	natCache     map[string][]natObservation
+	natCache     map[string]int
 	natCacheRead time.Time
-	natBindings  map[int]natBinding
 )
 
-type natObservation struct {
-	port       int
-	observedAt time.Time
-}
+const natCacheTTL = 2 * time.Second
 
-// natBinding associates an NNCS observation with one secure connection. RVCID
-// remains unique when multiple consoles share the same public IP.
-type natBinding struct {
-	ip         string
-	port       int
-	observedAt time.Time
-}
-
-const (
-	natCacheTTL          = 2 * time.Second
-	natObservationMaxAge = 2 * time.Minute
+// Station relay configuration (opt-in, OFF by default).
+//
+// A game server that cannot rely on direct P2P (both peers behind firewalled NATs with no
+// port forwarding) can stand in for the peers' station endpoint and forward between them.
+// Nothing here changes behaviour until a server calls SetStationRelay: relayHost stays
+// empty, StationRelay reports disabled, and every existing title keeps the plain natbridge
+// path untouched. Introduced for the Luigi's Mansion 3 server.
+var (
+	relayMu   sync.RWMutex
+	relayHost string
+	relayPort int
 )
+
+// SetStationRelay switches the station relay on (host + port of the relay socket) or off
+// (empty host). Off by default.
+func SetStationRelay(host string, port int) {
+	relayMu.Lock()
+	defer relayMu.Unlock()
+	relayHost = host
+	relayPort = port
+}
+
+// StationRelay reports the relay configuration (host, port, enabled).
+func StationRelay() (string, int, bool) {
+	relayMu.RLock()
+	defer relayMu.RUnlock()
+	return relayHost, relayPort, relayHost != "" && relayPort > 0
+}
+
+// NatPortForIP exposes the external UDP port the nncs responder observed for a public IP —
+// the endpoint peers must actually send station traffic to. Exported for game servers that
+// shape their own station records off the observed endpoint.
+func NatPortForIP(ip string) (int, bool) {
+	return natPortForIP(ip)
+}
 
 // natPortForIP returns the external UDP port the nncs responder observed for a public IP.
 func natPortForIP(ip string) (int, bool) {
@@ -96,126 +114,29 @@ func natPortForIP(ip string) (int, bool) {
 		if err != nil {
 			// No file: the responder is not co-located, or has not written yet. Report
 			// nothing rather than a stale guess — the caller falls back to the raw URLs.
-			natCache = map[string][]natObservation{}
+			natCache = map[string]int{}
 			natCacheRead = time.Now()
 
-			fmt.Printf("[natbridge] WARNING: NAT file %s not readable (%v) — "+
-				"no UDP endpoint observations available. P2P joins will use raw TCP ports.\n",
-				natFilePath(), err)
 			return 0, false
 		}
 
-		m := make(map[string][]natObservation)
-		now := time.Now()
+		m := make(map[string]int)
 		for _, line := range strings.Split(string(data), "\n") {
 			f := strings.Fields(line)
-			if len(f) < 2 {
+			if len(f) != 2 {
 				continue
 			}
-			// Timestamped observations are preferred and expire quickly: a UDP mapping from
-			// a previous game/server run is worse than no mapping because it points peers at
-			// a closed port. Two-field lines remain accepted for older responders.
-			observedAt := now
-			if len(f) >= 3 {
-				unix, err := strconv.ParseInt(f[2], 10, 64)
-				if err != nil {
-					continue
-				}
-				observedAt = time.Unix(unix, 0)
-				age := now.Sub(observedAt)
-				if age > natObservationMaxAge || age < -5*time.Minute {
-					continue
-				}
-			}
 			if p, err := strconv.Atoi(f[1]); err == nil && p > 0 && p < 65536 {
-				observations := m[f[0]]
-				updated := false
-				for i := range observations {
-					if observations[i].port == p {
-						observations[i].observedAt = observedAt
-						updated = true
-						break
-					}
-				}
-				if !updated {
-					observations = append(observations, natObservation{port: p, observedAt: observedAt})
-				}
-				m[f[0]] = observations
+				m[f[0]] = p
 			}
 		}
 		natCache = m
 		natCacheRead = time.Now()
 	}
 
-	observations := natCache[ip]
-	if len(observations) == 0 {
-		return 0, false
-	}
-	latest := observations[0]
-	for _, observation := range observations[1:] {
-		if observation.observedAt.After(latest.observedAt) {
-			latest = observation
-		}
-	}
+	p, ok := natCache[ip]
 
-	return latest.port, true
-}
-
-// natPortForStation resolves the endpoint for one secure connection. ReplaceURL
-// carries an RVCID and the UDP port Pia learned from NNCS. Matching both prevents
-// a later console behind the same router from overwriting the host's endpoint.
-func natPortForStation(ip string, rvcid, reportedPort int) (int, bool) {
-	if ip == "" || rvcid == 0 {
-		return 0, false
-	}
-
-	// Refresh the observation cache before taking the lock for the detailed lookup.
-	_, _ = natPortForIP(ip)
-
-	natCacheMu.Lock()
-	defer natCacheMu.Unlock()
-
-	observations := natCache[ip]
-	if len(observations) == 0 {
-		return 0, false
-	}
-	if binding, ok := natBindings[rvcid]; ok && binding.ip == ip {
-		for _, observation := range observations {
-			if observation.port == binding.port {
-				return binding.port, true
-			}
-		}
-		delete(natBindings, rvcid)
-	}
-
-	if reportedPort > 0 {
-		for _, observation := range observations {
-			if observation.port == reportedPort {
-				if natBindings == nil {
-					natBindings = make(map[int]natBinding)
-				}
-				natBindings[rvcid] = natBinding{
-					ip: ip, port: observation.port, observedAt: observation.observedAt,
-				}
-				return observation.port, true
-			}
-		}
-	}
-
-	// Older clients may not echo the learned port. Preserve compatibility only when
-	// there is one possible endpoint; guessing among multiple consoles is unsafe.
-	if len(observations) == 1 {
-		observation := observations[0]
-		if natBindings == nil {
-			natBindings = make(map[int]natBinding)
-		}
-		natBindings[rvcid] = natBinding{
-			ip: ip, port: observation.port, observedAt: observation.observedAt,
-		}
-		return observation.port, true
-	}
-
-	return 0, false
+	return p, ok
 }
 
 // natBridgeStations rebuilds a host's station URLs into the two-candidate shape a console
@@ -232,7 +153,7 @@ func natPortForStation(ip string, rvcid, reportedPort int) (int, bool) {
 // Returns the urls untouched whenever it cannot do better — no NAT observation, no
 // private address, no RVCID. A wrong port is a broken match; the raw URLs are at least
 // what the previous behaviour handed out.
-func natBridgeStations(urls []*StationURL) ([]*StationURL, bridgeStatus) {
+func natBridgeStations(urls []*StationURL, publicFirst bool) ([]*StationURL, bridgeStatus) {
 	local, public := selectStations(urls)
 	if local == nil || public == nil {
 		// Both candidates are required. A host reporting only one usually means its
@@ -252,17 +173,12 @@ func natBridgeStations(urls []*StationURL) ([]*StationURL, bridgeStatus) {
 		return urls, bridgeNoStations
 	}
 
-	cid := local.GetInt("RVCID")
-	if cid == 0 {
-		return urls, bridgeNoRVCID
-	}
-
-	udpPort, ok := natPortForStation(publicAddr, cid, local.GetInt("port"))
+	udpPort, ok := natPortForIP(publicAddr)
 	if !ok {
 		// The nncs responder never saw this host. Either it has not probed yet, or its
 		// probe went to the OTHER responder — the one on the other machine, whose file
 		// this server cannot read.
-		natBridgeSkip("no unambiguous nncs observation for "+publicAddr, urls)
+		natBridgeSkip("no nncs observation for "+publicAddr, urls)
 
 		return urls, bridgeNoObservation
 	}
@@ -270,27 +186,53 @@ func natBridgeStations(urls []*StationURL) ([]*StationURL, bridgeStatus) {
 	// The RVCID comes from the host's ReplaceURL, sent AFTER its NAT handshake. This is the
 	// one shortfall worth waiting on: the host is expected to report it within about a
 	// second, and a joiner routinely asks before it does.
-	lan := public.Copy()
-	lan.Set("address", privateAddr)
+	cid := local.GetInt("RVCID")
+	if cid == 0 {
+		return urls, bridgeNoRVCID
+	}
+
+	// La station LAN se construit à partir de la station LOCALE de l'hôte (son ReplaceURL), PAS de
+	// la publique : elle porte déjà l'adresse privée, les vrais natf/natm de l'hôte, le RVCID et —
+	// surtout — le CID (l'identifiant de connexion de l'hôte dont la Pia du visiteur a besoin pour
+	// MONTER la session P2P après le perçage). L'ancien code copiait la station publique et
+	// PERDAIT ce CID : le visiteur perçait le NAT mais la session Pia ne se montait jamais →
+	// « console ne répond pas » (2618-0502). On n'échange que le port UDP (celui observé par nncs) ;
+	// type/Pa sont retirés pour que la console reconnaisse le candidat LOCAL (une URL LAN portant
+	// type=public fait sauter le candidat par Pia). Prouvé par la capture nex-go GetSessionURLs :
+	// LAN = address=<privée>;port=<udp>;CID=<cid du ReplaceURL>;RVCID.
+	lan := local.Copy()
 	lan.SetInt("port", udpPort)
-	lan.SetInt("RVCID", cid)
-	lan.Set("natf", "34")
-	lan.Set("natm", "1")
 	lan.Remove("type")
 	lan.Remove("Pa")
 
 	pub := public.Copy()
 	pub.SetInt("port", udpPort)
 	pub.SetInt("type", int(StationURLFlagBehindNAT|StationURLFlagPublic|stationURLFlagSwitch))
-	pub.Set("Pa", privateAddr)
+	// Pa mirrors the proven server. MK8/S2 send Pa=<private> (the default); ACNH's Pia
+	// instead reads the public candidate's Pa as the endpoint to reach, so it must be the
+	// PUBLIC address — the nex-go server ACNH is known to work against sends address==Pa==
+	// public (capture acnh nexgo_reference.bin). Pa=<private> there sends the joiner's probe
+	// to the host's LAN address and stalls it at "getting ready to depart" (2618-0502).
+	pa := privateAddr
+	if publicFirst {
+		pa = publicAddr
+	}
+	pub.Set("Pa", pa)
 
 	// Say so on every substitution. Whether this bridge fires is the whole difference
 	// between a joinable host and a session that stalls at MatchMakingExt m=1, and it
 	// depends on a file written by another process — so it must be visible in the log
 	// rather than inferred from players reporting that it works.
-	fmt.Printf("[natbridge] %s: registered tcp port %d -> observed udp port %d (lan=%s rvcid=%d, per-connection)\n",
-		publicAddr, public.GetInt("port"), udpPort, privateAddr, cid)
+	fmt.Printf("[natbridge] %s: registered tcp port %d -> observed udp port %d (lan=%s rvcid=%d, publicFirst=%v)\n",
+		publicAddr, public.GetInt("port"), udpPort, privateAddr, cid, publicFirst)
 
+	// Station order. MK8/S2 take [lan, public] (the default). ACNH's Pia treats the FIRST
+	// station as the primary P2P candidate and never falls through to the second, so a
+	// remote joiner handed [lan, ...] probes the unreachable 192.168.x address and fails;
+	// the nex-go server ACNH works against sends [public, lan]. Reproduce that here.
+	if publicFirst {
+		return []*StationURL{pub, lan}, bridgeOK
+	}
 	return []*StationURL{lan, pub}, bridgeOK
 }
 
