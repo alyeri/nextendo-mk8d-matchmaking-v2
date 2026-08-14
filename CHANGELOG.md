@@ -2,30 +2,21 @@
 
 ## Unreleased
 
+### Changed
+
+- Resynchronized the game server to upstream revision `5322f40196e9c59385cecf9aff6a04323b3e2e72`.
+- Resynchronized the NEX core to upstream revision `967c90247487294f52541afc9c7290a5e063f768`.
+- Preserved the newly published profile, friend, tournament and ranking implementations.
+- Reframed the repository as incremental, cherry-pickable integration work rather than a replacement core.
+
 ### Added
 
-- Signed `nx2` account binding from LoginEx BAAS extra data.
-- FIFO shared-NAT identity claims for ticketless secure CONNECT compatibility.
-- Atomic join and party-seat reservations.
-- Server-owned room phases and epochs.
-- Adaptive attribute-prefix compatibility.
-- NAT/direct-readiness host scoring.
-- Reconnection leases and host connection restoration.
-- Host-loss migration to the best observed live participant.
-- Mutating RMC response deduplication.
-- Intermission-specific disconnect grace.
-- Stale-room janitor with phase-sensitive TTLs.
-- Conservative IP/PID rate limiting.
-- Redis presence, room snapshots, global room index and ownership leases.
-- Private Bearer-authenticated dashboard and POST-only eviction endpoint.
-- Docker, CI, architecture, testing, security and proposal documentation.
+- Bounded RMC mutation deduplication with completed-response caching and in-flight coalescing.
+- Atomic PID-keyed seat reservations with expiration, cancellation and concurrency tests.
+- Updated integration, security, configuration, testing and staging documentation.
 
-### Guarded
+### Removed from this integration branch
 
-- Pre-race host replacement is disabled by default.
-- Party reservation awaits a client-provided party identifier.
-
-### Known limitations
-
-- Secure CONNECT may still require temporal PID binding when no usable ticket is presented.
-- Redis discovery does not yet provide authoritative cross-instance join routing.
+- Shared-NAT FIFO identity assignment.
+- Redis coordination, rate limiting, lifecycle, reconnect and host-scoring experiments.
+- Claims that the repository is ready for a wholesale production replacement.

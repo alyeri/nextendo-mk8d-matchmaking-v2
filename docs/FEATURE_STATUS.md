@@ -1,90 +1,38 @@
 # Feature status
 
-This document distinguishes working behavior from guarded foundations.
+## Included and tested
 
-## Active and compatible
+| Feature | Status | Boundary |
+|---|---|---|
+| Current public Nextendo core | Synced | Profiles, Miis, friends, tournaments and rankings preserved. |
+| Completed RMC retry cache | Active | Mutating matchmaking allowlist only. |
+| Concurrent RMC coalescing | Active | One underlying execution per identical in-flight key. |
+| Dedup TTL and size bound | Active | Configurable; default 20 seconds / 4096 entries. |
+| Atomic seat reservation | Active | PID-keyed, mutex-protected and capacity-aware. |
+| Reservation expiry/cancel | Active | Default eight seconds; cancellation is idempotent. |
 
-### Signed authentication
+## Inherited unchanged
 
-The server verifies the HMAC and expiry of the `nx2` token and requires its PID to match the account
-ID supplied by the game. Production should use `NEXTENDO_REQUIRE_SIGNED_TOKEN=1`.
+- Signed `nx2` extraction and account validation.
+- Player profiles, nicknames, Miis and online friends.
+- Tournament creation, search, registration and rankings.
+- NAT-aware room compatibility and existing participant notifications.
+- Current room cleanup/reaper and dashboard behavior.
 
-### Shared-NAT login ordering
+## Not included
 
-Multiple fresh LoginEx claims from one address are queued and consumed in order. Claims are short
-lived and single use.
+| Earlier experiment | Decision |
+|---|---|
+| Shared-NAT FIFO identity queue | Removed as unsafe without cryptographic CONNECT binding. |
+| Redis room directory | Deferred; unrelated to the first accepted changes. |
+| Rate limiting | Deferred to its own coordinated change. |
+| Formal room lifecycle | Deferred to its own coordinated change. |
+| Reconnect lease / host scoring | Deferred; requires larger protocol validation. |
+| Party reservations | Not inferred from IP/friends; no stable client party ID exists. |
 
-### Reservations and overbooking prevention
+## Validation still required
 
-Pending reservations count against room capacity. A join commits only while its reservation remains
-valid.
-
-### Lifecycle and cleanup
-
-Rooms have validated phases, activity timestamps and separate TTLs for searches versus established
-sessions. A background janitor removes stale control-plane state.
-
-### Retry deduplication
-
-Mutating requests are cached briefly. Repeated packets do not create a second room, participant or
-ownership migration.
-
-### Intermission recovery
-
-Disconnects in results, ready or search/map-selection phases can receive a longer grace window than
-ordinary transport loss.
-
-### Host-loss migration
-
-After the old host's grace expires, the server selects the best live participant using observed
-quality, transfers ownership if needed and updates the host connection ID.
-
-This preserves a lobby when possible; it cannot reconstruct an already-running P2P race.
-
-### Abuse protection
-
-Authentication is limited by IP. Matchmaking is limited independently by IP and PID, with a stricter
-bucket for expensive create/join/search calls. Blocks are temporary and progressive.
-
-Excluded paths: P2P race packets, NAT probes, PRUDP ping/keep-alive traffic and notifications.
-
-## Implemented but configuration-dependent
-
-### Adaptive compatibility
-
-Enabled when `MATCHMAKING_COMPAT_ATTRIBUTES` is greater than zero. The required prefix is reduced
-one attribute per `MATCHMAKING_RELAX_AFTER_SECONDS`. At zero, behavior remains game-mode-only.
-
-### Redis directory
-
-Enabled only with `REDIS_URL`. It publishes expiring per-instance and per-room records. In-memory
-matchmaking remains authoritative.
-
-## Guarded or awaiting client support
-
-### Pre-race best-host selection
-
-The scoring and reassignment path exists behind `MATCHMAKING_PRE_RACE_HOST_SELECTION`. Default is
-off because changing HostPID before the race may require a client notification sequence that has not
-yet been classified for MK8D.
-
-### Party/group matchmaking
-
-The engine can atomically reserve seats for a PID list. Existing retail-compatible clients do not
-send a party ID or roster, so the server does not infer parties from IP addresses or friend lists.
-
-### Independent rejoin token
-
-Current reentry is bound to the signed account PID. A separate signed, single-use rejoin token would
-require an additional client/server field. No undocumented wire field is repurposed here.
-
-### Authoritative multi-instance joins
-
-Redis provides discovery and ownership leases, but routing a player to another instance still needs
-an ingress or handoff mechanism.
-
-## Known protocol debt
-
-The largest remaining issue is a secure CONNECT that may arrive without a usable Kerberos ticket.
-The short-lived authenticated FIFO claim is safer than a global last-PID mapping, but complete
-cryptographic binding should ultimately be implemented in the ticket/CONNECT exchange.
+- A real 6–12 player, multi-network soak test.
+- Production-volume observation near the reported ~60 concurrent-player workload.
+- Packet-loss/retry testing against actual Ryujinx and Atmosphère clients.
+- Maintainer review of the exact mutation allowlist and reservation integration points.

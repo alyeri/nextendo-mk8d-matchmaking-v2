@@ -139,3 +139,21 @@ func TestRMCDeduplicatorDoesNotCacheReadOnlySessionURLs(t *testing.T) {
 		t.Fatal("asynchronous GetSessionURLs must not be deduplicated")
 	}
 }
+
+func TestRMCDeduplicatorEnforcesEntryBound(t *testing.T) {
+	settings := nex.NewSwitchSettings("test", 40000)
+	conn := dedupTestConnection(settings, 1, 1)
+	dedup := newRMCDeduplicator(time.Minute, 2)
+	handler := dedup.wrap(func(_ *nex.Connection, req *nex.RMCMessage) *nex.RMCMessage {
+		return nex.NewRMCSuccess(settings, req.Protocol, req.Method, req.CallID, nil)
+	})
+	for callID := uint32(1); callID <= 20; callID++ {
+		handler(conn, dedupTestRequest(settings, callID, nil))
+	}
+	dedup.mu.Lock()
+	entries := len(dedup.entries)
+	dedup.mu.Unlock()
+	if entries > 2 {
+		t.Fatalf("entries=%d, want at most 2", entries)
+	}
+}

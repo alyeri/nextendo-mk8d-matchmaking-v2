@@ -1,87 +1,63 @@
-# Testing and evaluation plan
+# Testing and soak plan
 
 ## Automated checks
 
-Run from the repository root:
+Run both modules independently:
 
 ```sh
 cd nextendo-nex
-go test ./...
+go test -count=1 ./...
 go vet ./...
+go test -race -count=1 ./...
 
 cd ../server
-go test ./...
+go test -count=1 ./...
 go vet ./...
+go test -race -count=1 ./...
 ```
 
-On Linux with CGO and a C compiler:
+The reservation suite covers capacity accounting, expiry, idempotent cancellation and 64 concurrent
+PIDs competing for one seat. The dedup suite covers completed retries, cloned response bodies,
+in-flight concurrency, identity/payload separation, nil responses, expiry and read-only exclusion.
 
-```sh
-cd nextendo-nex && go test -race ./...
-cd ../server && go test -race ./...
-```
+## RMC retry integration test
 
-CI runs formatting, unit tests, vet, Linux builds and the race detector.
+1. Instrument the underlying create handler with an execution counter.
+2. Send the same mutating RMC request repeatedly with the same connection/PID/call ID/body.
+3. Send several copies concurrently before the first handler returns.
+4. Confirm one mutation, one room ID and byte-equivalent responses.
+5. Reuse the call ID with a different body; confirm a separate mutation.
+6. Repeat from another PID/connection; confirm isolation.
+7. Wait beyond the TTL; confirm a new execution is allowed.
 
-## Required staging matrix
+## Reservation integration test
 
-### Client/network combinations
+1. Create a room with one remaining seat.
+2. Race simultaneous join attempts from different authenticated PIDs.
+3. Confirm one reservation succeeds and every other attempt receives session-full behavior.
+4. Confirm `NumParticipants` excludes the reservation before commit.
+5. Commit the winner and confirm the room reaches exactly its maximum.
+6. Repeat with an abandoned reservation and verify expiry frees the seat.
 
-- Two Ryujinx instances behind the same NAT.
-- Ryujinx clients on separate residential networks.
-- Ryujinx and Atmosphère together, if the Atmosphère client supports the required signed login.
-- At least one restrictive NAT and one direct-ready NAT.
-- 6–12 players from at least three networks.
+## Real-client soak matrix
 
-### Game modes
+Test Worldwide, Regional, private rooms and tournaments separately. Use:
 
-- Worldwide.
-- Regional.
-- Friends/private room.
-- Tournament flow.
-- Battle mode, if routed through the same server configuration.
+- 2 clients behind the same household NAT;
+- clients on at least three unrelated networks;
+- a mix of Ryujinx and Atmosphère where available;
+- 6, 8 and 12-player rooms;
+- 60–120 minute sessions including map selection and results transitions.
 
-### Lifecycle scenarios
+Record sanitized counts only: underlying mutations, dedup hits/waiters, reservation accepts/rejects,
+room count, communication errors and server panics. Do not publish IP addresses, account tokens,
+Miis or packet captures.
 
-1. Join a newly created room.
-2. Join a nearly full room concurrently from multiple clients.
-3. Complete at least four consecutive races.
-4. Remain through results and map selection.
-5. Disconnect a non-host for less than the grace period and reconnect.
-6. Disconnect the host and reconnect before expiry.
-7. Let the host expire during map selection and observe migration.
-8. Exit voluntarily and verify immediate room release.
-9. Leave a search room idle and verify janitor cleanup.
-10. Restart Redis during a live room and verify the race/server continues.
+## Acceptance criteria
 
-### Abuse and retry scenarios
-
-- Replay the same mutating RMC request and confirm one state change.
-- Exceed auth limits from a test address and verify temporary recovery.
-- Exceed expensive matchmaking limits without affecting another PID behind the same NAT.
-- Send invalid dashboard query tokens and GET mutations; expect 403/405.
-- Confirm dashboard and Redis ports are unreachable externally.
-
-## Success criteria
-
-- No duplicate participant or duplicate room from retry traffic.
-- No capacity overbooking.
-- Rejoining PID returns to the same room during grace.
-- Stale rooms disappear within configured TTL.
-- A Redis outage does not end an active room.
-- Legitimate MK8D bursts do not trigger rate limits.
-- No regression in average time to find a room.
-- Communication-error rate is lower than or equal to the baseline.
-
-## Evidence to collect
-
-- Server commit/hash and configuration with secrets removed.
-- Number of players, networks and NAT types.
-- Room IDs, lifecycle phases and timestamps.
-- Reconnect leases created/recovered/expired.
-- Reservations rejected and joins committed.
-- Rate-limit block counts.
-- Communication-error count and phase where each occurred.
-- Whether the player or server ended the session.
-
-Do not publish raw tokens, public IP addresses or private station URLs in test reports.
+- No duplicate room from identical retransmitted create calls.
+- No room exceeds `MaxParticipants` including pending reservations.
+- No cross-PID or cross-connection cached response reuse.
+- No regressions in profiles, friends, tournaments, rankings or NAT matchmaking tests.
+- No data races in either module.
+- No statistically meaningful increase in communication errors versus the current server.

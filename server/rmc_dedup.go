@@ -88,6 +88,12 @@ func (d *rmcDeduplicator) wrap(next nex.RMCHandler) nex.RMCHandler {
 				}
 				delete(d.entries, key)
 			}
+			if len(d.entries) >= d.maxEntries {
+				// Preserve a hard memory bound. Under sustained unique-key pressure,
+				// execute normally rather than evicting a still-live idempotency key.
+				d.mu.Unlock()
+				return next(conn, req)
+			}
 
 			entry := &rmcDedupEntry{ready: make(chan struct{})}
 			d.entries[key] = entry

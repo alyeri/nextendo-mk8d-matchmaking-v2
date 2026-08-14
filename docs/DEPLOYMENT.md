@@ -1,122 +1,52 @@
-# Deployment
+# Staging deployment
 
-This guide targets an isolated staging server. Do not redirect production users until the test
-matrix in [TESTING.md](TESTING.md) has passed.
+Do not replace the production MK8D server directly. Deploy this branch to an isolated staging
+endpoint first.
 
-## Required network ports
+## Exposed ports
 
-| Port | Protocol | Purpose |
-|---|---|---|
-| 443 | TCP | TLS TicketGranting/LoginEx endpoint |
-| 60003 | TCP | Secure NEX/PRUDP-over-WebSocket endpoint |
-| 10025, 10125 | UDP | NNCS NAT probes |
-| 33334 | UDP | NNCS silent-port behavior |
-| 50920 | UDP | NNCS filtering probe source |
-| 18082 | TCP | Private admin API; loopback only |
-| 6379 | TCP | Redis; private Docker network/loopback only |
+| Port | Protocol | Exposure |
+|---:|---|---|
+| 443 | TCP | Public authentication endpoint. |
+| 60003 | TCP | Public secure NEX endpoint. |
+| 18082 | TCP | Host loopback only; maps to dashboard port 8082. |
 
-Cloud firewall rules should expose only the game TCP and NNCS UDP ports. Never expose 18082 or
-6379 to the public Internet.
+No Redis or NNCS ports are used by this branch.
 
-## Docker Compose staging deployment
-
-1. Install Docker Engine and the Compose plugin.
-2. Copy the environment template:
-
-   ```sh
-   cp .env.example .env
-   chmod 600 .env
-   ```
-
-3. Replace every `CHANGE_ME` value. Generate secrets, for example:
-
-   ```sh
-   openssl rand -hex 32
-   ```
-
-4. Set `NEXTENDO_HOST` and `NNCS_PUBLIC_IP` to the staging server's public IPv4 address.
-5. For initial staging, `NEXTENDO_AUTO_CERT=1` creates a self-signed certificate. Production must
-   provide a trusted certificate and set it to `0`.
-6. Start the stack:
-
-   ```sh
-   docker compose up -d --build
-   docker compose logs -f server
-   ```
-
-The Compose file publishes the dashboard only as `127.0.0.1:18082` on the host and does not publish
-Redis at all.
-
-## Dashboard access
-
-Use an SSH tunnel:
+## Docker Compose
 
 ```sh
-ssh -L 18082:127.0.0.1:18082 user@staging-server
+cp .env.example .env
+mkdir -p secrets
+# Install cert.pem and key.pem in ./secrets with restrictive permissions.
+# Replace every CHANGE_ME value in .env.
+docker compose config
+docker compose up -d --build
 ```
 
-Then query with a Bearer token:
+The container runs as a non-root user with only `NET_BIND_SERVICE`, a read-only root filesystem and
+the TLS directory mounted read-only. The dashboard is published only on `127.0.0.1:18082`.
+
+Health check through an SSH tunnel or locally on the host:
 
 ```sh
-curl -H "Authorization: Bearer $DASH_TOKEN" http://127.0.0.1:18082/api/rooms
+curl http://127.0.0.1:18082/healthz
 ```
 
-Eviction is POST-only:
+Access statistics only with the configured inherited dashboard token; do not expose the dashboard
+directly to the Internet.
 
-```sh
-curl -X POST \
-  -H "Authorization: Bearer $DASH_TOKEN" \
-  -H "Content-Type: application/json" \
-  --data '{"pid":1800000001}' \
-  http://127.0.0.1:18082/api/kick
-```
+## Rollout
 
-## Native systemd deployment
-
-Build a static Linux binary:
-
-```sh
-cd server
-CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -ldflags="-s -w" -o mk8d-server .
-```
-
-Recommended service properties:
-
-- dedicated unprivileged user;
-- `AmbientCapabilities=CAP_NET_BIND_SERVICE` instead of running as root;
-- `NoNewPrivileges=true`;
-- strict filesystem protection with one writable data directory;
-- environment file mode `0600`;
-- automatic restart on failure;
-- loopback Redis and dashboard binds.
-
-Always keep the prior binary and environment file before replacing them. Check that no players or
-rooms are active through `/api/stats` before a planned restart.
-
-## Redis behavior
-
-Redis is optional. With `REDIS_REQUIRED=0`, startup and active rooms continue when Redis is
-temporarily unavailable. Use `REDIS_REQUIRED=1` only when infrastructure policy requires Redis to
-be healthy before accepting traffic.
-
-Do not treat the room index as authorization or as authoritative cross-instance join state.
+1. Record current production error and room-creation baselines.
+2. Validate two clients, including separate accounts behind one NAT.
+3. Validate profiles, friends, tournaments and rankings.
+4. Force duplicate RMC retries and concurrent final-seat joins.
+5. Run the multi-network soak matrix in [Testing](TESTING.md).
+6. Compare results before proposing an upstream cherry-pick.
 
 ## Rollback
 
-1. Stop accepting new traffic at the staging ingress.
-2. Confirm whether active rooms remain.
-3. Restore the previous binary and environment file.
-4. Restart the service.
-5. Leave Redis data intact unless schema incompatibility is proven; all state keys expire.
-6. Record the failing commit, sanitized logs and reproduction steps.
-
-## Production readiness gate
-
-Do not promote until:
-
-- strict signed auth works for every supported client type;
-- 6–12 player and multi-room staging tests pass;
-- host-loss and intermission recovery are measured;
-- rate limits show no false positives;
-- external scans confirm dashboard and Redis are closed;
-- a maintainer reviews the ticketless CONNECT risk.
+This work is split into independent commits. Roll back reservations separately from deduplication;
+do not replace the official core with an older copy. Preserve sanitized logs long enough to identify
+whether a failure occurred in the wrapper, capacity accounting or unchanged upstream behavior.
