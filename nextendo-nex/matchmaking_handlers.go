@@ -94,6 +94,7 @@ type gathering struct {
 	participants []uint64 // participant PIDs (index 0 = owner/host)
 	hostConnID   uint32   // the host's connection id (for station URLs + notifications)
 	code         string   // private-room code (0x44)
+	reservations map[uint64]joinReservation
 }
 
 // Matchmaking is the in-memory matchmaking store + handlers, replicating the
@@ -135,17 +136,23 @@ type Matchmaking struct {
 	// publish themselves are unchanged.
 	OnFriendSessionCreated func(pid uint64, gid uint32)
 
-	notif      *notifStore
-	mu         sync.Mutex
-	gatherings map[uint32]*gathering
-	byCode     map[string]uint32
-	nextGID    uint32
-	codeRand   uint32
+	notif          *notifStore
+	mu             sync.Mutex
+	gatherings     map[uint32]*gathering
+	byCode         map[string]uint32
+	nextGID        uint32
+	codeRand       uint32
+	reservationTTL time.Duration
+	now            func() time.Time
 }
 
 // NewMatchmaking returns an empty store.
 func NewMatchmaking() *Matchmaking {
-	return &Matchmaking{gatherings: map[uint32]*gathering{}, byCode: map[string]uint32{}, nextGID: 1, codeRand: 0x1234, notif: newNotifStore()}
+	return &Matchmaking{
+		gatherings: map[uint32]*gathering{}, byCode: map[string]uint32{},
+		nextGID: 1, codeRand: 0x1234, notif: newNotifStore(),
+		reservationTTL: defaultJoinReservationTTL, now: time.Now,
+	}
 }
 
 // ExtensionHandler handles MatchmakeExtension (0x6D).
@@ -405,7 +412,10 @@ func (m *Matchmaking) createGathering(conn *Connection, src *MatchmakeSession) *
 	m.nextGID++
 	session := *src
 	finalizeCreatedSession(&session, gid, conn.PID)
-	g := &gathering{session: &session, participants: []uint64{conn.PID}, hostConnID: conn.ID}
+	g := &gathering{
+		session: &session, participants: []uint64{conn.PID}, hostConnID: conn.ID,
+		reservations: make(map[uint64]joinReservation),
+	}
 	m.gatherings[gid] = g
 	return g
 }
@@ -553,6 +563,7 @@ func (m *Matchmaking) autoMatchmake(conn *Connection, req *RMCMessage) *RMCMessa
 	joinerClass := classifyNAT(conn.NATBehaviour())
 
 	m.mu.Lock()
+	now := m.now()
 	var g *gathering
 	skippedNAT := 0
 	// [Nextendo] A solo-isolated PID (NEX_SOLO_PIDS) never joins an existing lobby: it always
@@ -565,7 +576,7 @@ func (m *Matchmaking) autoMatchmake(conn *Connection, req *RMCMessage) *RMCMessa
 			if cand.session.GameMode == src.GameMode &&
 				cand.session.OpenParticipation &&
 				!cand.session.UserPasswordEnabled &&
-				uint16(len(cand.participants)) < cand.session.MaxParticipants {
+				uint16(m.occupiedSeatsLocked(cand, now)) < cand.session.MaxParticipants {
 				// Skip a lobby the joiner can't hole-punch with (would give everyone 2618-0510);
 				// keep looking for a compatible one.
 				if !gatheringNATCompatible(ep, joinerClass, cand.participants, conn.PID) {
@@ -589,9 +600,12 @@ func (m *Matchmaking) autoMatchmake(conn *Connection, req *RMCMessage) *RMCMessa
 			fmt.Printf("[MM] NAT-aware: pid=%d class=%s incompatible with %d open lobby(ies) -> opened own gid=%d\n",
 				conn.PID, joinerClass, skippedNAT, g.session.ID)
 		}
-	} else if !containsPID(g.participants, conn.PID) {
-		g.participants = append(g.participants, conn.PID)
-		joined = true
+	} else if m.reserveJoinLocked(g, conn.PID) {
+		joined = m.commitReservedJoinLocked(g, conn.PID)
+	} else {
+		// Capacity changed between selection and reservation. Keep the request
+		// successful without overbooking by creating a new gathering.
+		g = m.createGathering(conn, src)
 	}
 	g.session.NumParticipants = uint32(len(g.participants))
 	result := *g.session
@@ -660,12 +674,11 @@ func (m *Matchmaking) joinSession(conn *Connection, req *RMCMessage) *RMCMessage
 		// salon en 9/8. On respecte le MaxParticipants PROPRE à la session (fixé par le jeu) :
 		// 12 pour MK8, 8 pour Splatoon 2 (10 en privé), la taille configurée pour Smash/Salmon Run.
 		// Le client rebascule alors sur un autre salon au lieu de casser un match plein.
-		if g.session.MaxParticipants > 0 && uint16(len(g.participants)) >= g.session.MaxParticipants {
+		if !m.reserveJoinLocked(g, conn.PID) {
 			m.mu.Unlock()
 			return NewRMCError(s, ProtocolMatchmakeExtension, req.CallID, ResultRendezVousSessionFull)
 		}
-		g.participants = append(g.participants, conn.PID)
-		joined = true
+		joined = m.commitReservedJoinLocked(g, conn.PID)
 	}
 	g.session.NumParticipants = uint32(len(g.participants))
 	result := *g.session
@@ -1178,6 +1191,7 @@ func (m *Matchmaking) RemovePlayer(pid uint64) {
 		if g == nil || g.session == nil {
 			continue
 		}
+		delete(g.reservations, pid)
 		before := len(g.participants)
 		g.participants = removePID(g.participants, pid)
 		if len(g.participants) == before {
@@ -1201,6 +1215,7 @@ func (m *Matchmaking) endParticipation(conn *Connection, req *RMCMessage) {
 	gid := NewStreamIn(req.Body, conn.Settings).U32()
 	m.mu.Lock()
 	if g := m.gatherings[gid]; g != nil {
+		delete(g.reservations, conn.PID)
 		g.participants = removePID(g.participants, conn.PID)
 		if len(g.participants) == 0 {
 			delete(m.gatherings, gid)

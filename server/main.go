@@ -80,6 +80,7 @@ func main() {
 	secureEndpoint.SetSecureAccount(securePassword, securePID)
 
 	mm := nex.NewMatchmaking()
+	mm.SetJoinReservationTTL(time.Duration(envOrInt("MATCHMAKING_RESERVATION_SECONDS", 8)) * time.Second)
 	rmcDedup := newRMCDeduplicator(
 		time.Duration(envOrInt("MATCHMAKING_DEDUP_SECONDS", 20))*time.Second,
 		envOrInt("MATCHMAKING_DEDUP_MAX_ENTRIES", defaultRMCDedupEntries),
