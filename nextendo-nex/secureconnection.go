@@ -28,15 +28,21 @@ const (
 type SecureConnectionConfig struct {
 	// PublicStationType is the `type` param on the public station. Switch Pia 5.19 (SSBU)
 	// wants 0x0B (BehindNAT|Public|Switch); older Pia (Splatoon 2) wants the Wii U-era 0x03
-	// (BehindNAT|Public). Measurement with the client held constant: the proven S2 server
+	// (BehindNAT|Public). Wire capture with the client held constant: the proven S2 server
 	// answers type=3, the proven SSBU one type=11.
 	PublicStationType uint8
 	// SetPa adds Pa=<address> to the public station. Pia 5.19 needs it to build the NAT
 	// probe; the proven S2 server sends NO Pa at all.
 	SetPa bool
-	// OnStationUpdate receives a read-only snapshot after Register or ReplaceURL.
-	// It is intended for monitoring and matchmaking quality policy.
-	OnStationUpdate func(pid uint64, stations []*StationURL, replaceSeen bool)
+
+	// PublicHost / P2PAnchorPort / P2PRelay are consumed by servers that stand in for a
+	// host's station endpoint (a co-located host, or peers that can never reach each
+	// other directly). They are accepted here so such a server can configure itself; the
+	// shared Register path deliberately does NOT act on them, so every existing title
+	// keeps the plain behaviour.
+	PublicHost    string
+	P2PAnchorPort int
+	P2PRelay      bool
 }
 
 // SwitchPia519Config is what SSBU (Pia 5.19) needs: type=0x0B plus Pa.
@@ -71,7 +77,7 @@ func SecureConnectionHandlerWithConfig(cfg SecureConnectionConfig) RMCHandler {
 		case MethodRegister, MethodRegisterEx:
 			return handleRegister(conn, req, cfg)
 		case MethodReplaceURL:
-			return handleReplaceURL(conn, req, cfg)
+			return handleReplaceURL(conn, req)
 		default:
 			return notImplemented(conn, ProtocolSecureConnection, req)
 		}
@@ -121,7 +127,7 @@ func handleRegister(conn *Connection, req *RMCMessage, cfg SecureConnectionConfi
 		// one, and Pa ends up being the public address. We reproduce the resulting value, not
 		// the aliasing, so `local` stays a real LAN station for the P2P bridge. When the client
 		// DOES report its own public station, Pa is the LAN address, which is what a real
-		// console sends (a real console's public and local station address).
+		// console sends (capture ssbu_wsframes_2319: address=88.161.250.17, Pa=10.7.2.108).
 		// NOTE: both Pa variants are known to work on SSBU — the real console sends Pa=<LAN>
 		// and the proven server sends Pa=<public> — so the VALUE is not load-bearing there.
 		pa := local.Get("address")
@@ -134,9 +140,6 @@ func handleRegister(conn *Connection, req *RMCMessage, cfg SecureConnectionConfi
 	}
 
 	conn.SetStations([]*StationURL{local, public})
-	if cfg.OnStationUpdate != nil {
-		cfg.OnStationUpdate(conn.PID, conn.Stations(), false)
-	}
 	fmt.Printf("[Register] pid=%d -> local=%s\n           public=%s\n", conn.PID, local.String(), public.String())
 
 	out := NewStreamOut(s)
@@ -154,7 +157,7 @@ func handleRegister(conn *Connection, req *RMCMessage, cfg SecureConnectionConfi
 // StationURL); the response is an empty success. We rebuild the station set deduped
 // by ADDRESS with the new url winning for its address (keeps the fresh LAN url,
 // removes stale duplicates), matching the proven server.
-func handleReplaceURL(conn *Connection, req *RMCMessage, cfg SecureConnectionConfig) *RMCMessage {
+func handleReplaceURL(conn *Connection, req *RMCMessage) *RMCMessage {
 	s := conn.Settings
 	in := NewStreamIn(req.Body, s)
 	_ = in.StationURLValue() // target (the url being replaced) — unused; we dedupe by address
@@ -184,9 +187,6 @@ func handleReplaceURL(conn *Connection, req *RMCMessage, cfg SecureConnectionCon
 		rebuilt = append(rebuilt, byAddr[a])
 	}
 	conn.SetStations(rebuilt)
-	if cfg.OnStationUpdate != nil {
-		cfg.OnStationUpdate(conn.PID, conn.Stations(), true)
-	}
 
 	fmt.Printf("[ReplaceURL] pid=%d -> new=%s (now %d station(s))\n", conn.PID, newStation.String(), len(rebuilt))
 	return NewRMCSuccess(s, ProtocolSecureConnection, req.Method, req.CallID, nil)

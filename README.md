@@ -124,6 +124,7 @@ environment because no C compiler was installed there. CI includes a Linux race-
 ## Documentation
 
 - [Architecture](docs/ARCHITECTURE.md)
+- [Upstream baseline](docs/UPSTREAM_BASELINE.md)
 - [Feature status](docs/FEATURE_STATUS.md)
 - [Security model](SECURITY.md)
 - [Configuration reference](docs/CONFIGURATION.md)

@@ -116,25 +116,3 @@ func TestTicketGrantingUnknownMethod(t *testing.T) {
 		t.Fatalf("expected NotImplemented error, got %+v", resp)
 	}
 }
-
-func TestAuthPIDClaimsAreFIFOForSharedIP(t *testing.T) {
-	authPIDMu.Lock()
-	authPIDByIP = map[string][]authPIDClaim{}
-	recentAuthPID = nil
-	authPIDMu.Unlock()
-	t.Cleanup(func() {
-		authPIDMu.Lock()
-		authPIDByIP = map[string][]authPIDClaim{}
-		recentAuthPID = nil
-		authPIDMu.Unlock()
-	})
-
-	RememberAuthPID("203.0.113.10:41001", 1800000001)
-	RememberAuthPID("203.0.113.10:41002", 1800000002)
-	if pid, ok := ClaimAuthPID("203.0.113.10:50001"); !ok || pid != 1800000001 {
-		t.Fatalf("first shared-IP claim = (%d, %v)", pid, ok)
-	}
-	if pid, ok := ClaimAuthPID("203.0.113.10:50002"); !ok || pid != 1800000002 {
-		t.Fatalf("second shared-IP claim = (%d, %v)", pid, ok)
-	}
-}

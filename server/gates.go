@@ -1,6 +1,6 @@
 package main
 
-// Online GATES enforced at NEX login — the same access rules for every session:
+// Online GATES enforced at NEX login — the SAME rules as the old infra:
 //   - Compte Nextendo OBLIGATOIRE (requireAccount): aucune identité de compte -> refus.
 //   - Online = comptes Nextendo UNIQUEMENT: un NSA de vraie console non lié / un serveur
 //     compte injoignable -> refus (fail-CLOSED : un profil non-Nextendo n'entre jamais).
@@ -68,6 +68,26 @@ const (
 var (
 	nsaCacheMu sync.Mutex
 	nsaCache   = map[uint64]uint64{}
+	// nsaNegCache memoise les resolutions QUI ONT ECHOUE (404 / injoignable). Sans lui,
+	// chaque tentative de login portant un NSA inconnu declenche un appel sortant vers le
+	// service de comptes PARTAGE : un flood de NSA bidons sur le port d'auth (non
+	// authentifie) se transforme en amplification contre le service dont TOUS les jeux
+	// dependent. Un TTL court garde la reactivite quand un compte vient d'etre lie.
+	nsaNegCache = map[uint64]nsaNegEntry{}
+	// nsaInflight plafonne les appels /api/nsa SIMULTANES : au-dela, on repond
+	// "injoignable" (fail-closed) sans ouvrir une connexion de plus.
+	nsaInflight = make(chan struct{}, nsaMaxInflight)
+)
+
+type nsaNegEntry struct {
+	status nsaStatus
+	at     time.Time
+}
+
+const (
+	nsaNegTTL      = 60 * time.Second
+	nsaMaxInflight = 16
+	nsaNegCacheMax = 4096
 )
 
 // resolveNSAtoPID mappe un NSA id (baasUserID d'une vraie Switch) vers le PID du compte
@@ -79,27 +99,56 @@ func resolveNSAtoPID(nsa uint64) (uint64, nsaStatus) {
 		nsaCacheMu.Unlock()
 		return pid, nsaOK
 	}
+	if neg, ok := nsaNegCache[nsa]; ok && time.Since(neg.at) < nsaNegTTL {
+		nsaCacheMu.Unlock()
+		return 0, neg.status // deja resolu comme inconnu/injoignable recemment : pas de nouvel appel
+	}
 	nsaCacheMu.Unlock()
+
+	// Plafond de requetes sortantes simultanees vers le service de comptes partage.
+	select {
+	case nsaInflight <- struct{}{}:
+		defer func() { <-nsaInflight }()
+	default:
+		return 0, nsaUnreachable // sature : fail-closed, sans ouvrir de connexion
+	}
 
 	resp, err := gateClient.Get(fmt.Sprintf("%s/api/nsa?id=%d", accountBaseURL, nsa))
 	if err != nil {
+		rememberNSAFailure(nsa, nsaUnreachable)
 		return 0, nsaUnreachable
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode == http.StatusNotFound {
+		rememberNSAFailure(nsa, nsaUnknown)
 		return 0, nsaUnknown
 	}
 	if resp.StatusCode != http.StatusOK {
+		rememberNSAFailure(nsa, nsaUnreachable)
 		return 0, nsaUnreachable
 	}
 	var out struct {
 		PID uint64 `json:"pid"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil || out.PID == 0 {
+		rememberNSAFailure(nsa, nsaUnreachable)
 		return 0, nsaUnreachable
 	}
 	nsaCacheMu.Lock()
 	nsaCache[nsa] = out.PID
+	delete(nsaNegCache, nsa) // le compte vient d'etre lie : la memoire negative ne doit pas survivre
 	nsaCacheMu.Unlock()
 	return out.PID, nsaOK
+}
+
+// rememberNSAFailure memoise un echec de resolution pour nsaNegTTL. La table est bornee :
+// un flood de NSA bidons ne doit pas la faire grossir sans limite (on la vide entierement
+// au plafond plutot que de la laisser croitre — les entrees ne valent que 60s de toute facon).
+func rememberNSAFailure(nsa uint64, st nsaStatus) {
+	nsaCacheMu.Lock()
+	if len(nsaNegCache) >= nsaNegCacheMax {
+		nsaNegCache = map[uint64]nsaNegEntry{}
+	}
+	nsaNegCache[nsa] = nsaNegEntry{status: st, at: time.Now()}
+	nsaCacheMu.Unlock()
 }
