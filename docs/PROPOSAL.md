@@ -1,61 +1,45 @@
-# Proposal for Nextendo review
+# Incremental integration proposal
 
-## Summary
+## Maintainer feedback incorporated
 
-This repository proposes an incremental MK8D matchmaking resilience layer. It does not replace the
-P2P race protocol and does not require enabling every feature at once.
+The original repository was reviewed by the Nextendo owner. The review accepted RMC deduplication,
+atomic reservations, rate limiting and a formal room lifecycle as useful ideas, but requested that
+they be brought into the current core one at a time. It also rejected arrival-order identity
+assignment and identified that the public mirrors had gained profiles, friends, tournaments and
+rankings.
 
-## Problems addressed
+This branch implements that direction:
 
-- stale rooms and dead hosts remaining eligible;
-- duplicate mutations caused by retries or client stalls;
-- overbooking during concurrent joins;
-- fragile reentry around results/map selection;
-- incorrect identity inheritance for multiple clients behind one NAT;
-- insufficiently private operational endpoints;
-- no expiring room directory for future multi-instance routing.
+1. reset both source modules to the current public mirrors;
+2. preserve all newly published functionality;
+3. remove the shared-NAT FIFO identity queue;
+4. port RMC deduplication as one isolated commit;
+5. port atomic reservations as a second isolated commit;
+6. defer every other proposal.
 
-## Integration strategy
+## Suggested upstream split
 
-Recommended review units:
+### Change A: RMC deduplication
 
-1. Signed LoginEx proof and FIFO shared-NAT claims.
-2. Reservation and lifecycle primitives in `nextendo-nex`.
-3. Reconnection/host-loss cleanup.
-4. Retry deduplication and conservative rate limits.
-5. Redis state mirror/global directory and private dashboard.
-6. Guarded future features: pre-race host selection and parties.
+Review the server wrapper, mutation allowlist, bounded cache and concurrency tests. This change does
+not modify NEX wire encoding or matchmaking data structures.
 
-Each unit can be reviewed and enabled independently.
+### Change B: atomic reservations
 
-## Compatibility principles
+Review the reservation primitive and the small integration points in `matchmaking_handlers.go`.
+This change adds no wire fields and preserves client-visible participant counts.
 
-- Preserve serialized NEX structures.
-- Do not reinterpret unknown attributes by guesswork.
-- Do not send undocumented client fields.
-- Keep Redis out of the race packet path.
-- Default uncertain behavior off.
-- Treat explicit exits differently from transient transport loss.
+Each change should be accepted, revised or rejected independently. Rate limiting and lifecycle work
+should not begin until maintainers confirm that nobody else is implementing them.
 
-## Evidence available
+## Evidence required before production
 
-- Automated unit tests for protocol, NAT mapping, reservations, lifecycle, host selection, Redis
-  records, auth proof parsing, rate limits and deduplication.
-- Repeat test runs and static analysis.
-- Linux reproducible builds.
-- Small real-world sessions completing multiple consecutive races on low-resource hardware.
+Automated tests establish deterministic semantics, not production safety. Before merging at the
+reported server scale of roughly sixty concurrent players, run multi-network client tests and
+compare duplicate-room, over-capacity and communication-error rates with the current deployment.
 
-## Evidence still needed before production
+## Identity follow-up
 
-- 6–12 player multi-network staging test.
-- Concurrent Worldwide/Regional/private rooms.
-- Atmosphère and emulator interoperability under strict signed auth.
-- Host loss during map selection and long soak sessions.
-- Baseline comparison of communication errors and matchmaking time.
-- Independent review of the ticketless CONNECT compatibility bridge.
-
-## Suggested rollout
-
-Deploy behind a staging hostname, collect sanitized metrics for one or two weeks, and promote only
-the features that demonstrate improvement. Keep `MATCHMAKING_PRE_RACE_HOST_SELECTION=0` until the
-required client migration notification is proven.
+Identity is intentionally outside this proposal. Any future design must bind the secure CONNECT to
+the account/PID proof itself. IP equality may be a routing signal but is not account identity, and
+FIFO ordering is never sufficient proof under CGNAT.

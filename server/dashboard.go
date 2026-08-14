@@ -339,13 +339,13 @@ func buildStats(endpoint *nex.Endpoint, mm *nex.Matchmaking) apiStats {
 
 	// Snapshot per-player metadata under the lock.
 	type metaSnap struct {
-		calls              int64
-		first, last        time.Time
-		proto              uint16
-		meth               uint32
-		ip                 string
-		natMap, natFilter  uint32
-		ping               uint32
+		calls             int64
+		first, last       time.Time
+		proto             uint16
+		meth              uint32
+		ip                string
+		natMap, natFilter uint32
+		ping              uint32
 	}
 	metaMu.Lock()
 	snap := make(map[uint64]metaSnap, len(playerMeta))

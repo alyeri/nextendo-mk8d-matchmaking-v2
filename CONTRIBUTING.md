@@ -5,7 +5,8 @@
 - Preserve wire compatibility unless a change is explicitly versioned.
 - Do not guess undocumented protocol meanings when an unknown state can be represented honestly.
 - Add a focused test for every lifecycle, security or serialization change.
-- Keep P2P race traffic out of Redis and control-plane middleware.
+- Keep changes incremental and preserve the current public Nextendo feature set.
+- Never infer account identity from IP addresses or connection arrival order.
 - Never commit credentials, user tokens, IP captures, saves, keys or copyrighted game assets.
 
 ## Development workflow
@@ -23,6 +24,6 @@
 - [ ] Unit tests cover success, rejection and expiry/retry behavior.
 - [ ] Secrets and personal network data are absent.
 - [ ] New environment variables are documented in `server/example.env`.
-- [ ] Redis failure behavior is defined.
+- [ ] The change is based on the documented upstream revisions or explicitly rebased.
 - [ ] Production defaults are conservative.
 - [ ] The proposal includes a staging test and rollback plan.

@@ -61,6 +61,9 @@ func (m *Matchmaking) reserveJoinLocked(g *gathering, pid uint64) bool {
 	}
 	now := m.now()
 	m.expireJoinReservationsLocked(g, now)
+	if g.reservations == nil {
+		g.reservations = make(map[uint64]joinReservation)
+	}
 	if _, exists := g.reservations[pid]; exists {
 		g.reservations[pid] = joinReservation{expires: now.Add(m.reservationTTL)}
 		return true

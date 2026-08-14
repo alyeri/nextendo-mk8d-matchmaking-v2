@@ -1,63 +1,55 @@
-# Security policy and model
+# Security policy
 
-## Reporting a vulnerability
+## Scope
 
-Do not open a public issue containing credentials, private keys, access tokens, exploitable player
-data or a working denial-of-service procedure. Contact the repository owner privately and include:
+This branch changes retry handling and room-capacity accounting. It does not claim to solve NEX
+transport security, CGNAT traversal or ticketless secure-connection identity binding.
 
-- affected commit and component;
-- reproduction conditions;
-- expected impact;
-- whether active exploitation was observed;
-- a minimal proof of concept with secrets removed.
+## Identity boundary
 
-No bug bounty is promised by this experimental project.
+The shared-NAT FIFO identity queue from the earlier experiment has been removed. Never assign a PID
+because it was the next claim associated with an IP address. Under carrier-grade NAT, unrelated
+players share a public address and their authentication/CONNECT operations can interleave.
 
-## Current protections
+A future ticketless binding is acceptable only if the CONNECT supplies a nonce/token/proof that:
 
-- HMAC-signed, expiring `nx2` account proof bound to the requested PID.
-- Optional strict rejection of unsigned/bare account PIDs.
-- One-time, short-lived FIFO identity claims for ticketless secure CONNECT compatibility.
-- IP/PID rate limits and progressive temporary blocks on control-plane calls.
-- Atomic room reservations and bounded in-memory caches.
-- Redis bound privately, authenticated and treated as non-authoritative.
-- Dashboard bound to loopback by default.
-- `Authorization: Bearer` instead of query-string credentials.
-- Administrative mutations require POST and bounded JSON bodies.
-- No IP addresses, tickets, station URLs or session keys in Redis room snapshots.
-- Expiring room, presence and service keys.
+1. is cryptographically verifiable by the server;
+2. identifies the same account and PID as the signed `nx2` claim;
+3. is single-use or replay-bounded;
+4. cannot be selected by arrival order or source address alone.
 
-## Production requirements
+If the current protocol cannot carry that evidence, reject the connection or change the client
+protocol. Do not silently fall back to identity guessing.
 
-- Set `NEXTENDO_REQUIRE_ACCOUNT=1` and `NEXTENDO_REQUIRE_SIGNED_TOKEN=1`.
-- Generate independent high-entropy values for every secret.
-- Never copy `server/example.env` unchanged into production.
-- Use a trusted TLS certificate and protect the private key.
-- Keep `DASH_BIND=127.0.0.1`; access the API through an SSH tunnel or authenticated proxy.
-- Bind Redis to a private interface or Docker network; do not publish port 6379 publicly.
-- Restrict ingress to the exact TCP/UDP ports the service requires.
-- Run as a dedicated non-root user with systemd or container hardening.
-- Rotate secrets and invalidate sessions after suspected exposure.
-- Retain bounded logs and avoid logging raw tokens or complete authorization headers.
+## Deduplication boundary
 
-## Trust boundaries
+- Cache keys include PID, connection, protocol, method, call ID and body hash.
+- Only an allowlist of mutating matchmaking methods is deduplicated.
+- Read-only calls and asynchronous URL retrieval are excluded.
+- Responses are cloned to prevent callers from mutating cached state.
+- In-flight entries unblock even if the wrapped handler panics; the panic still propagates.
+- TTL and maximum-entry controls bound retention.
 
-- The account service is trusted to issue `nx2` proofs.
-- The outer BAAS JWT is decoded only as a container; its authenticity is not assumed by this server.
-- Clients and peers are untrusted.
-- Redis is operational infrastructure, not an authorization authority.
-- The dashboard token grants administrative visibility and eviction capability.
-- P2P participants necessarily receive peer network endpoints.
+Deduplication is not authorization. A request must already be authenticated and authorized by the
+underlying handler.
 
-## Known risks
+## Reservation boundary
 
-1. A stolen valid `nx2` token can be replayed until expiry.
-2. Ticketless CONNECT binding is temporal rather than end-to-end cryptographic.
-3. A determined distributed denial-of-service attack requires upstream/cloud mitigation.
-4. Host migration cannot preserve all in-race P2P state.
-5. This code has not undergone an independent security audit or penetration test.
+- Reservations are keyed by PID and protected by the matchmaking mutex.
+- Expired reservations do not consume capacity.
+- A reservation does not make a PID a participant and is not reported to clients.
+- Cancellation is idempotent.
 
-## Supported versions
+## Deployment
 
-Only the latest commit on the default branch is intended to receive security fixes during the
-experimental phase.
+- Keep `.env`, certificates, signing secrets and dashboard tokens outside Git.
+- Require signed account tokens in production.
+- Publish only the auth and secure game ports.
+- Keep the inherited dashboard on loopback or a private network and require `DASH_TOKEN`.
+- Do not deploy this branch as a wholesale replacement before multi-network soak testing.
+
+## Reporting
+
+Do not open a public issue containing credentials, private keys, player IPs, PIDs, Miis, captures or
+account tokens. Contact the repository owner privately and include only the minimum reproduction
+information needed.
