@@ -530,7 +530,7 @@ func startDashboard(endpoint *nex.Endpoint, mm *nex.Matchmaking) {
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) { fmt.Fprintln(w, "ok") })
 
 	fmt.Printf("[MK8 Dashboard] stats API on :%s (token=%v)\n", port, token != "")
-	if err := http.ListenAndServe(":"+port, mux); err != nil {
+	if err := http.ListenAndServe("0.0.0.0:"+port, mux); err != nil {
 		fmt.Printf("[MK8 Dashboard] HTTP error: %v\n", err)
 	}
 }
